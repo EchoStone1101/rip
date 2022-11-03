@@ -18,9 +18,9 @@
 use rlink::{DeviceHandle, Direction, Device, PError, RlinkError, EtherType};
 use timer::Timer;
 use chrono::{Duration, Utc};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{/* mpsc */ IpAddr, Ipv4Addr}; // Use `flume` for better performance
 use std::thread;
-use std::sync::{mpsc, Mutex, Arc};
+use std::sync::{Mutex, Arc};
 use std::fmt;
 use std::collections::{HashMap};
 
@@ -101,11 +101,11 @@ enum RipPacket {
 /// A library instance. Details are opaque outside this library.
 pub struct RipCtl {
     /// The main dispatching thread
-    main_thread: thread::JoinHandle<Result<(), mpsc::RecvError>>,
+    main_thread: thread::JoinHandle<Result<(), flume::RecvError>>,
     /// Receiver of IP packets whose destination is a local IP (and not an LSP)
-    rx: mpsc::Receiver<Ipv4Packet>,
+    rx: flume::Receiver<Ipv4Packet>,
     /// Sender of IP packets to the main thread
-    tx: mpsc::Sender<RipPacket>,
+    tx: flume::Sender<RipPacket>,
     /// Handle for manually configuring the routing table
     rules: Arc<Mutex<Vec<RoutingRule>>>,
 }
@@ -116,6 +116,8 @@ impl RipCtl {
     /// Default TTL for Rip packets.
     pub const RIP_TTL: u8 = 64;
 
+    pub const RIP_QUEUE_SZ: usize = 4096;
+
     /// Initiate the Rip library. First the main dispatch thread is created, then 
     /// it spawns and manages worker threads, ND thread and LS thread.
     /// Note that this function should only be called once. 
@@ -124,9 +126,10 @@ impl RipCtl {
     pub fn init(veth_only: bool) -> RipCtl {
 
         // Channel for sending IPv4 packets to the user interface
-        let (usr_tx, usr_rx) = mpsc::channel::<Ipv4Packet>();
+        let (usr_tx, usr_rx) = flume::unbounded::<Ipv4Packet>();
         // Channel for sending packets to the main thread
-        let (mt_tx, mt_rx) = mpsc::channel::<RipPacket>();
+        // Bounded, to emulate real routers, which might drop packets if the RX queue is full
+        let (mt_tx, mt_rx) = flume::bounded::<RipPacket>(RipCtl::RIP_QUEUE_SZ);
 
         // Initiate routing table. Keep a clone of the handle of rules, then move 
         // the table into the main thread.
@@ -134,7 +137,7 @@ impl RipCtl {
         let rules = routing_table.get_rules_writer();
 
         // Spawn the main dispatch thread
-        let main_thread: thread::JoinHandle<Result<(), mpsc::RecvError>> = {
+        let main_thread: thread::JoinHandle<Result<(), flume::RecvError>> = {
             let mt_tx = mt_tx.clone();
             let usr_tx = usr_tx.clone();
             thread::spawn(move || {
@@ -142,7 +145,7 @@ impl RipCtl {
                 // `routing_table` moved; it is further moved to the LS thread
                 let mut routing_table = routing_table;
                 let mut workers: Vec<WorkerThread> = Vec::new();
-                let (ls_tx, ls_rx) = mpsc::channel();
+                let (ls_tx, ls_rx) = flume::unbounded();
     
                 // Builds an LSP over time
                 let lsp = 
@@ -166,7 +169,7 @@ impl RipCtl {
     
                     timer.schedule_repeating(Duration::seconds(1), move || {
                         // ND triggered
-                        mt_tx.send(RipPacket::NDP(NDPacket{
+                        mt_tx.try_send(RipPacket::NDP(NDPacket{
                             ip: Ipv4Addr::new(0x0u8, 0x0u8, 0x0u8, 0x0u8),
                             mac: MacAddress::new([0x0u8; 6]),
                             // rx_ip=unspecified, so that the main thread knows that this NDP
@@ -204,7 +207,7 @@ impl RipCtl {
                 
                 let routing_table_handle = routing_table.get_table_reader();
 
-                let ls_thread: thread::JoinHandle<Result<(), mpsc::RecvError>> = {
+                let ls_thread: thread::JoinHandle<Result<(), flume::RecvError>> = {
                     // Clone tx end of main thread, for flooding LSP back
                     let mt_tx = mt_tx.clone();               
                     thread::spawn(move || {
@@ -225,7 +228,7 @@ impl RipCtl {
                                         if lsn_list[idx].lsp.version < version {
                                             // Flood this LSP
                                             let ip_packet = lsp.as_ipv4_packet().unwrap();
-                                            mt_tx.send(RipPacket::IPv4(ip_packet));
+                                            mt_tx.try_send(RipPacket::IPv4(ip_packet));
                                             lsn_list[idx].lsp = lsp;
                                             lsn_list[idx].birth = Utc::now().timestamp_micros();
                                             update = true;
@@ -237,7 +240,7 @@ impl RipCtl {
                             if let Some(lsp) = lsp {
                                 // Flood this LSP
                                 let ip_packet = lsp.as_ipv4_packet().unwrap();
-                                mt_tx.send(RipPacket::IPv4(ip_packet));
+                                mt_tx.try_send(RipPacket::IPv4(ip_packet));
     
                                 lsn_list.push(LinkStateNode{
                                     lsp,
@@ -453,9 +456,9 @@ impl RipCtl {
         veth_only: bool,
         workers: &mut Vec<WorkerThread>,
         // The following are tx ends that are possibly cloned and sent to new worker threads
-        mt_tx: &mpsc::Sender<RipPacket>,
-        usr_tx: &mpsc::Sender<Ipv4Packet>,
-        ls_tx: &mpsc::Sender<LinkStatePacket>) 
+        mt_tx: &flume::Sender<RipPacket>,
+        usr_tx: &flume::Sender<Ipv4Packet>,
+        ls_tx: &flume::Sender<LinkStatePacket>) 
     {
         // Worker threads terminate once any availablility issue occurs, i.e. if
         // the device cannot be opened, or is turned down after a while. The main
@@ -571,7 +574,7 @@ impl RipCtl {
                                                 let elapsed = Utc::now().timestamp_micros() - ndp.timestamp;
                                                 let cost = if elapsed < 0 {0u32} else {elapsed as u32 / 2};
                                                 ndp.timestamp = cost as i64;
-                                                mt_tx.send(RipPacket::NDP(ndp));
+                                                mt_tx.try_send(RipPacket::NDP(ndp));
                                             }
                                         }
                                         continue;
@@ -616,7 +619,7 @@ impl RipCtl {
                                     }
 
                                     // Mismatched IP to the main thread
-                                    mt_tx.send(RipPacket::IPv4(ip_packet));
+                                    mt_tx.try_send(RipPacket::IPv4(ip_packet));
                                 }
                             }
                         }

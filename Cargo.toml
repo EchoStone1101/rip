@@ -10,3 +10,4 @@ rlink = { path = "../rlink"}
 timer = "0.2.0"
 chrono = "0.4"
 radix_trie = "0.2"
+flume = "0.10"
